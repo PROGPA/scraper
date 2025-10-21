@@ -1,13 +1,15 @@
 #!/bin/bash
 
 echo "======================================"
-echo " Email Scraper - Starting on Railway "
+echo "Email Scraper - Starting on Railway"
 echo "======================================"
 
-# Always install Playwright and dependencies
-echo "Installing Playwright browsers and dependencies..."
-python -m playwright install --with-deps chromium || echo "Warning: Playwright install failed, continuing anyway..."
+# Install Playwright browsers if not already installed
+if command -v playwright &> /dev/null; then
+    echo "Installing Playwright browsers..."
+    playwright install chromium || echo "Warning: Playwright install failed, continuing anyway..."
+    playwright install-deps chromium || echo "Warning: Playwright deps install failed, continuing anyway..."
+fi
 
-# Start FastAPI backend with uvicorn (auto-binds to Railway port)
 echo "Starting backend server..."
-uvicorn backend:app --host 0.0.0.0 --port ${PORT:-8080}
+python backend.py

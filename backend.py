@@ -1381,6 +1381,21 @@ async def admin_page():
     except Exception:
         return HTMLResponse("<h3>admin.html not found</h3>", status_code=404)
 
+# Serve static files (CSS and JS)
+@app.get("/style.css")
+async def serve_css():
+    try:
+        return FileResponse("style.css", media_type="text/css")
+    except Exception:
+        raise HTTPException(status_code=404, detail="style.css not found")
+
+@app.get("/app.js")
+async def serve_js():
+    try:
+        return FileResponse("app.js", media_type="application/javascript")
+    except Exception:
+        raise HTTPException(status_code=404, detail="app.js not found")
+
 # User management endpoints
 @app.post("/api/register")
 async def register_user(data: dict):
