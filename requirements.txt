@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+playwright
+aiofiles
+requests
+beautifulsoup4
