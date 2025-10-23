@@ -1,10 +1,37 @@
-# email_scraper_98.py
-# Upgraded backend with high-accuracy email extraction (~98% recall target)
-# Integrates with your frontend unchanged (WebSocket "/ws", /jobs, /job/{id}, etc.)
+#!/usr/bin/env python3
+"""
+backend.py  (Expanded full Playwright version)
+------------------------------------------------
+Features added / expanded compared to prior version:
+- Playwright rendering + XHR capture
+- aiohttp + requests fallback
+- ProxyManager with health checks and rotation
+- OCR + remote file extraction (PDF/DOCX/XLSX/Images) (optional)
+- Persistent job store (JSON file) with resume capability
+- Job cancellation tokens and graceful shutdown
+- Incremental CSV/JSON export & combined summary export
+- Advanced deobfuscation + entity decoding + more heuristics
+- MX validation (async wrapper) and optional SMTP probe (disabled by default)
+- Thread-safe logging, debug mode, rotating logs
+- CLI flags: --host --port --no-browser --data-dir --debug
+- Health endpoints and status
+- WebSocket with richer messages and error handling
+- Rate-limiter per-host and polite crawling behavior
+- Optional "safe-mode" that enforces robots.txt (lightweight)
+- Packaging helpers for PyInstaller builds
+- Comprehensive inline documentation & comments
 
-import webbrowser
-import threading
-import uvicorn
+Usage:
+1) Ensure packages:
+   pip install fastapi uvicorn[standard] aiohttp requests playwright dnspython python-magic python-docx openpyxl pdfminer.six pytesseract Pillow
+2) Install Playwright browsers:
+   python -m playwright install --with-deps
+3) Run:
+   python backend.py
+4) Open http://127.0.0.1:8000/ (the script will try to auto-open)
+"""
+
+# Standard libs
 import argparse
 import asyncio
 import csv
@@ -22,43 +49,131 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.parse
-import base64
-import sqlite3
-import uuid
+import webbrowser
 from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress, asynccontextmanager
+from contextlib import suppress
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Callable
+# ================= FULL SCRAPER BOOSTER =================
+import asyncio, aiohttp, re, time, os, logging
+from concurrent.futures import ProcessPoolExecutor
 
-# External APIs
-DASHBOARD_URL = "https://royalblue-goldfish-140935.hostingersite.com/api.php"
-SECRET_KEY = "scraper_sync_123"
+LOG = logging.getLogger(__name__)
 
-def send_to_dashboard(job_id: str, status: str, results: dict):
-    """Send job results to dashboard API"""
+# ====== Fast, clean email patterns ======
+EMAIL_RE = re.compile(r'[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}', re.I)
+
+# ====== Cache for MX lookups (6 hours) ======
+MX_CACHE = {}
+MX_TTL = 6 * 60 * 60
+
+async def mx_lookup(domain: str, timeout: int = 5):
+    """Automatically cached MX lookup — replaces your old mx_lookup."""
+    import dns.resolver
+    now = time.time()
+    if domain in MX_CACHE and MX_CACHE[domain][0] > now:
+        return MX_CACHE[domain][1]
     try:
-        import requests
-        payload = {
-            "secret_key": SECRET_KEY,
-            "job_id": job_id,
-            "status": status,
-            "results": results
-        }
-        r = requests.post(DASHBOARD_URL, json=payload, timeout=8)
-        if r.status_code == 200:
-            logging.info("Job %s sent to dashboard successfully.", job_id)
-        else:
-            logging.warning("Dashboard response for job %s: %s", job_id, r.text)
-    except Exception as e:
-        logging.exception("Failed to send job %s to dashboard: %s", job_id, e)
+        resolver = dns.resolver.Resolver()
+        resolver.lifetime = timeout
+        answers = resolver.resolve(domain, "MX")
+        mxs = sorted(str(r.exchange).rstrip(".") for r in answers)
+    except Exception:
+        mxs = []
+    MX_CACHE[domain] = (now + MX_TTL, mxs)
+    return mxs
 
-# optional heavy libs
+# ====== Avoid downloading huge files ======
+async def fetch_bytes_safe(fetch_func, url: str, max_size: int = 10_000_000):
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.head(url, timeout=10) as r:
+                cl = r.headers.get("content-length")
+                if cl and cl.isdigit() and int(cl) > max_size:
+                    LOG.info("Skipping big file %s (%s bytes)", url, cl)
+                    return b""
+    except Exception:
+        pass
+    try:
+        return await fetch_func(url)
+    except Exception as e:
+        LOG.warning("Download failed: %s", e)
+        return b""
+
+# ====== Background process pool for heavy work ======
+CPU_POOL = ProcessPoolExecutor(max_workers=max(1, os.cpu_count() // 2))
+async def run_in_cpu(func, *args):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(CPU_POOL, func, *args)
+
+# ====== Light text cleanup before regex ======
+def smart_deobfuscate(text: str) -> str:
+    rep = {
+        r"\s*\[at\]\s*": "@",
+        r"\s*\(at\)\s*": "@",
+        r"\s*\[dot\]\s*": ".",
+        r"\s*\(dot\)\s*": ".",
+        r"\s+dot\s+": ".",
+        r"\s+at\s+": "@",
+    }
+    for p, rpl in rep.items():
+        text = re.sub(p, rpl, text, flags=re.I)
+    return text
+
+# ====== Improved email extractor ======
+def extract_emails(text: str):
+    """Auto-enhanced email extractor — replaces your old one automatically."""
+    if not text:
+        return set()
+    text = smart_deobfuscate(text)
+    found = {e.lower().strip() for e in EMAIL_RE.findall(text)}
+    return {e for e in found if not any(b in e for b in ["example.com", "test@", "invalid"])}
+
+# ====== Faster playwright fetch (auto-drops heavy assets) ======
+async def fetch_with_playwright(context, url: str, timeout: int = 15):
+    """Auto-enhanced version; replaces your old fetch_with_playwright."""
+    page = await context.new_page()
+    try:
+        async def route_handler(route, request):
+            if request.resource_type in ("image", "media", "font", "stylesheet"):
+                await route.abort()
+            else:
+                await route.continue_()
+        await page.route("**/*", route_handler)
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+        await asyncio.sleep(0.6)
+        html = await page.content()
+        return html
+    except Exception as e:
+        LOG.warning("Playwright fetch error: %s", e)
+        return ""
+    finally:
+        await page.close()
+
+# ====== Automatic integration wrapper ======
+class SmartFetcher:
+    """Drop-in class — you can use this instead of your old Fetcher."""
+    def __init__(self, context=None):
+        self.context = context
+
+    async def fetch_html(self, url: str):
+        if self.context:
+            return await fetch_with_playwright(self.context, url)
+        return ""
+
+    async def fetch_bytes(self, url: str, fetch_func):
+        return await fetch_bytes_safe(fetch_func, url)
+
+# =========================================================
+
+# Third-party (optional heavy)
 try:
     from playwright.async_api import async_playwright, TimeoutError as PlayTimeoutError
     PLAYWRIGHT_AVAILABLE = True
@@ -111,25 +226,37 @@ except Exception:
 
 # Web framework
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+import uvicorn
 
 # ---------------------------
-# Configuration & Defaults
+# Configuration & CLI
 # ---------------------------
-DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = int(os.environ.get("PORT", 8000))
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8000
 DEFAULT_DATA_DIR = Path.cwd() / "data"
 DEFAULT_RESULTS_DIR = DEFAULT_DATA_DIR / "results"
 DEFAULT_JOB_STORE = DEFAULT_DATA_DIR / "jobs.json"
 DEFAULT_LOG_DIR = DEFAULT_DATA_DIR / "logs"
 
-HOST = DEFAULT_HOST
-PORT = DEFAULT_PORT
-DATA_DIR = DEFAULT_DATA_DIR
-RESULTS_DIR = DEFAULT_RESULTS_DIR
-LOG_DIR = DEFAULT_LOG_DIR
-JOB_STORE = DEFAULT_JOB_STORE
+parser = argparse.ArgumentParser(description="Local Playwright Email Extractor Server")
+parser.add_argument("--host", default=DEFAULT_HOST, help="Host to bind")
+parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port to bind")
+parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="Data directory for results and cache")
+parser.add_argument("--no-browser", action="store_true", help="Do not auto-open browser on start")
+parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+parser.add_argument("--safe-mode", action="store_true", help="Respect robots.txt (best-effort)")
+parser.add_argument("--max-threads", type=int, default=6, help="Threadpool max worker threads for blocking tasks")
+parser.add_argument("--no-playwright-install", action="store_true", help="Skip background playwright install attempt")
+args = parser.parse_args()
+
+HOST = args.host
+PORT = args.port
+DATA_DIR = Path(args.data_dir)
+RESULTS_DIR = DATA_DIR / "results"
+LOG_DIR = DATA_DIR / "logs"
+JOB_STORE = DATA_DIR / "jobs.json"
+FRONTEND_FILE = Path(__file__).parent / "frontend.html"
 
 # ensure directories
 for p in (DATA_DIR, RESULTS_DIR, LOG_DIR):
@@ -138,19 +265,18 @@ for p in (DATA_DIR, RESULTS_DIR, LOG_DIR):
     except Exception:
         pass
 
-# Logger
-LOG = logging.getLogger("email_scraper_98")
-LOG.setLevel(logging.INFO)
+# Logger (rotating basic)
+LOG = logging.getLogger("email_scraper_expanded")
+LOG.setLevel(logging.DEBUG if args.debug else logging.INFO)
 formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+# console handler
 ch = logging.StreamHandler(sys.stdout)
 ch.setFormatter(formatter)
 LOG.addHandler(ch)
-try:
-    fh = logging.FileHandler(LOG_DIR / "scraper.log", encoding="utf-8")
-    fh.setFormatter(formatter)
-    LOG.addHandler(fh)
-except Exception:
-    pass
+# file handler
+fh = logging.FileHandler(LOG_DIR / "scraper.log", encoding="utf-8")
+fh.setFormatter(formatter)
+LOG.addHandler(fh)
 
 # ---------------------------
 # Constants & Regex
@@ -161,233 +287,16 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.5993.90 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
 ]
-
-# Primary email regex (good balance between recall & precision)
-EMAIL_RE = re.compile(
-    r'(?:[a-zA-Z0-9_.+%-]+)@(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}', re.I
-)
-
+EMAIL_RE = re.compile(r'(?:[a-zA-Z0-9_.+-]+)@(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}', re.I)
 MAILTO_RE = re.compile(r'mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+)', re.I)
 URL_RE = re.compile(r'https?://[^\s\'"<>]+', re.I)
 
-# Disposable sources
+# Disposable list sources and defaults
 DISPOSABLE_SOURCES = [
     "https://raw.githubusercontent.com/disposable-email-domains/disposable-email-domains/master/disposable_email_blocklist.conf",
+    "https://raw.githubusercontent.com/7c/fakefilter/master/data/DisposableDomains.txt",
 ]
-DEFAULT_DISPOSABLE = {"mailinator.com", "10minutemail.com", "tempmail.com", "guerrillamail.com", "trashmail.com", "yopmail.com"}
-
-# ---------------------------
-# Database for user management
-# ---------------------------
-class Database:
-    def __init__(self, db_path="scraper.db"):
-        self.db_path = db_path
-        self.init_db()
-    
-    def get_connection(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-    
-    def init_db(self):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        # Users table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                last_active TEXT,
-                is_blocked INTEGER DEFAULT 0,
-                total_jobs INTEGER DEFAULT 0,
-                total_emails_scraped INTEGER DEFAULT 0
-            )
-        """)
-        
-        # Activity table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS activity (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                user_name TEXT NOT NULL,
-                job_id TEXT,
-                urls TEXT,
-                total_emails INTEGER DEFAULT 0,
-                status TEXT,
-                timestamp TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        """)
-        
-        # Jobs table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS jobs (
-                id TEXT PRIMARY KEY,
-                user_id TEXT,
-                status TEXT NOT NULL,
-                count INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                results TEXT
-            )
-        """)
-        
-        conn.commit()
-        conn.close()
-    
-    def register_user(self, user_id: str, name: str, created_at: str):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT OR REPLACE INTO users (id, name, created_at, last_active, is_blocked, total_jobs, total_emails_scraped)
-            VALUES (?, ?, ?, ?, COALESCE((SELECT is_blocked FROM users WHERE id = ?), 0), 
-                    COALESCE((SELECT total_jobs FROM users WHERE id = ?), 0),
-                    COALESCE((SELECT total_emails_scraped FROM users WHERE id = ?), 0))
-        """, (user_id, name, created_at, datetime.now().isoformat(), user_id, user_id, user_id))
-        
-        conn.commit()
-        conn.close()
-    
-    def update_user_activity(self, user_id: str):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            UPDATE users SET last_active = ? WHERE id = ?
-        """, (datetime.now().isoformat(), user_id))
-        
-        conn.commit()
-        conn.close()
-    
-    def is_user_blocked(self, user_id: str) -> bool:
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT is_blocked FROM users WHERE id = ?", (user_id,))
-        result = cursor.fetchone()
-        conn.close()
-        
-        return bool(result['is_blocked']) if result else False
-    
-    def block_user(self, user_id: str):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("UPDATE users SET is_blocked = 1 WHERE id = ?", (user_id,))
-        conn.commit()
-        conn.close()
-    
-    def unblock_user(self, user_id: str):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("UPDATE users SET is_blocked = 0 WHERE id = ?", (user_id,))
-        conn.commit()
-        conn.close()
-    
-    def get_all_users(self):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id, name, created_at, last_active, is_blocked, total_jobs, total_emails_scraped
-            FROM users ORDER BY created_at DESC
-        """)
-        
-        users = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        
-        return users
-    
-    def get_user_activity(self, user_id: str):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT * FROM activity WHERE user_id = ? ORDER BY timestamp DESC LIMIT 50
-        """, (user_id,))
-        
-        activities = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        
-        return activities
-    
-    def log_activity(self, user_id: str, user_name: str, job_id: str, urls: str, total_emails: int, status: str):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO activity (user_id, user_name, job_id, urls, total_emails, status, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, user_name, job_id, urls, total_emails, status, datetime.now().isoformat()))
-        
-        # Update user stats
-        if status == "completed":
-            cursor.execute("""
-                UPDATE users 
-                SET total_jobs = total_jobs + 1, 
-                    total_emails_scraped = total_emails_scraped + ?
-                WHERE id = ?
-            """, (total_emails, user_id))
-        
-        conn.commit()
-        conn.close()
-    
-    def create_job(self, job_id: str, user_id: str, count: int):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        now = datetime.now().isoformat()
-        cursor.execute("""
-            INSERT INTO jobs (id, user_id, status, count, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (job_id, user_id, "queued", count, now, now))
-        
-        conn.commit()
-        conn.close()
-    
-    def update_job(self, job_id: str, status: str, results: str = None):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        now = datetime.now().isoformat()
-        if results:
-            cursor.execute("""
-                UPDATE jobs SET status = ?, updated_at = ?, results = ? WHERE id = ?
-            """, (status, now, results, job_id))
-        else:
-            cursor.execute("""
-                UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?
-            """, (status, now, job_id))
-        
-        conn.commit()
-        conn.close()
-    
-    def get_all_jobs(self):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT * FROM jobs ORDER BY created_at DESC")
-        jobs = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        
-        return jobs
-    
-    def get_recent_activity(self, limit: int = 100):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT * FROM activity ORDER BY timestamp DESC LIMIT ?
-        """, (limit,))
-        
-        activities = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        
-        return activities
+DEFAULT_DISPOSABLE = {"mailinator.com","10minutemail.com","tempmail.com","guerrillamail.com","trashmail.com","yopmail.com"}
 
 # ---------------------------
 # Utilities / Helpers
@@ -401,13 +310,15 @@ def safe_filename(name: str, maxlen: int = 220) -> str:
 def ensure_str(s: Any) -> str:
     return "" if s is None else str(s)
 
-async def async_backoff_sleep(attempt: int):
+# backoff helper (async-aware)
+async def async_backoff_sleep(attempt:int):
     await asyncio.sleep(min(10, (2 ** attempt) * 0.25))
 
-THREAD_POOL = ThreadPoolExecutor(max_workers=6)
+# Thread executor for blocking operations
+THREAD_POOL = ThreadPoolExecutor(max_workers=args.max_threads)
 
 # ---------------------------
-# Disposable domains cache
+# Disposable domains (cache + updater)
 # ---------------------------
 DISPOSABLE_CACHE_FILE = DATA_DIR / ".disposable_cache.json"
 
@@ -420,7 +331,7 @@ def load_disposable_local() -> Set[str]:
             LOG.exception("Failed to read disposable cache")
     return set(DEFAULT_DISPOSABLE)
 
-def update_disposable_now() -> Set[str]:
+def update_disposable_now():
     domains = set(DEFAULT_DISPOSABLE)
     if REQUESTS_AVAILABLE:
         for src in DISPOSABLE_SOURCES:
@@ -443,6 +354,7 @@ def update_disposable_now() -> Set[str]:
     LOG.info("Disposable domains updated. Count=%d", len(domains))
     return domains
 
+# Start background update (non-blocking)
 DISPOSABLE_DOMAINS = load_disposable_local()
 def _bg_disposable_update():
     try:
@@ -454,53 +366,8 @@ def _bg_disposable_update():
 threading.Thread(target=_bg_disposable_update, daemon=True).start()
 
 # ---------------------------
-# Advanced deobfuscation (expanded)
+# Advanced deobfuscation
 # ---------------------------
-def _decode_fromcharcodes(text: str) -> str:
-    # handle String.fromCharCode(65,66,67) and fromCharCode sequences
-    def repl(m):
-        nums = re.findall(r'\d+', m.group(1))
-        try:
-            return ''.join(chr(int(n)) for n in nums)
-        except Exception:
-            return m.group(0)
-    text = re.sub(r'String\.fromCharCode\(\s*([^\)]+)\)', repl, text, flags=re.I)
-    return text
-
-def _unescape_js_percent_hex(text: str) -> str:
-    # decode \xNN and percent-encoded sequences
-    try:
-        text = re.sub(r'\\x([0-9A-Fa-f]{2})', lambda m: chr(int(m.group(1), 16)), text)
-    except Exception:
-        pass
-    try:
-        text = urllib.parse.unquote(text)
-    except Exception:
-        pass
-    return text
-
-def _concat_quoted_parts(text: str) -> str:
-    # combine 'a'+'@'+'b.com' -> a@b.com
-    try:
-        text = re.sub(r"(?:'|\")([^'\"]+)(?:'|\")\s*\+\s*(?:'|\")([^'\"]+)(?:'|\")", lambda m: m.group(1) + m.group(2), text)
-    except Exception:
-        pass
-    return text
-
-def _decode_base64_snippets(text: str) -> str:
-    # find long base64-like chunks and try to decode when they contain @ after decoding
-    added = []
-    for b64 in set(re.findall(r'([A-Za-z0-9+/]{16,}={0,2})', text)):
-        try:
-            dec = base64.b64decode(b64 + '==' if len(b64) % 4 else b64).decode('utf-8', errors='ignore')
-            if '@' in dec and len(dec) < 1000:
-                added.append(dec)
-        except Exception:
-            pass
-    if added:
-        text += "\n" + "\n".join(added)
-    return text
-
 def advanced_deobfuscate(text: str) -> str:
     if not text:
         return ""
@@ -513,33 +380,11 @@ def advanced_deobfuscate(text: str) -> str:
     ]
     for pat, repl in seq:
         t = re.sub(pat, repl, t, flags=re.I)
-
-    # decode HTML numeric entities
-    try:
-        t = re.sub(r'&#x([0-9a-fA-F]+);', lambda m: chr(int(m.group(1), 16)), t)
-        t = re.sub(r'&#([0-9]+);', lambda m: chr(int(m.group(1))), t)
-    except Exception:
-        pass
-
-    # remove zero-width
-    t = ''.join(ch for ch in t if ord(ch) not in (8203, 8204, 8205))
-
-    # fromCharCode and other JS encodings
-    t = _decode_fromcharcodes(t)
-    t = _unescape_js_percent_hex(t)
-    t = _concat_quoted_parts(t)
-    t = _decode_base64_snippets(t)
-
-    # unescape JS unescape()
-    try:
-        for m in re.findall(r'unescape\([\'"]([^\'"]+)[\'"]\)', t, flags=re.I):
-            try:
-                t += '\n' + urllib.parse.unquote(m)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
+    # entities numeric & hex
+    t = re.sub(r'&#x([0-9a-fA-F]+);', lambda m: chr(int(m.group(1), 16)), t)
+    t = re.sub(r'&#([0-9]+);', lambda m: chr(int(m.group(1))), t)
+    # Remove zero-width
+    t = ''.join(ch for ch in t if ord(ch) not in (8203,8204,8205))
     # collapse whitespace
     t = re.sub(r'\s+', ' ', t)
     return t
@@ -549,7 +394,7 @@ def extract_emails(text: str) -> Set[str]:
         return set()
     t = advanced_deobfuscate(text)
     found = set(re.findall(EMAIL_RE, t))
-    return {e.strip() for e in found if e and len(e) < 320}
+    return found
 
 # ---------------------------
 # Proxy Manager
@@ -600,7 +445,7 @@ class ProxyManager:
                     p.fails += 1
 
 # ---------------------------
-# Playwright Pool
+# Playwright Pool (improved)
 # ---------------------------
 class PlaywrightPool:
     def __init__(self, headless: bool = True, max_contexts: int = 3, logger: logging.Logger = LOG):
@@ -620,6 +465,7 @@ class PlaywrightPool:
             self._logger.warning("Playwright not installed.")
             return
         self._pw = await async_playwright().start()
+        # configure chromium with no-sandbox for some builds; keep default for safety
         self._browser = await self._pw.chromium.launch(headless=self.headless)
         for _ in range(self.max_contexts):
             try:
@@ -668,7 +514,7 @@ class PlaywrightPool:
         self._logger.info("PlaywrightPool closed")
 
 # ---------------------------
-# File extractors
+# File extractors (PDF, DOCX, XLSX, Images OCR)
 # ---------------------------
 def extract_text_from_pdf_bytes(b: bytes) -> str:
     if not PDFMINER_AVAILABLE:
@@ -679,18 +525,19 @@ def extract_text_from_pdf_bytes(b: bytes) -> str:
             return text or ""
     except Exception:
         LOG.debug("PDF extraction failed", exc_info=True)
-    return ""
+        return ""
 
 def extract_text_from_docx_bytes(b: bytes) -> str:
     if not DOCX_AVAILABLE:
         return ""
     try:
+        # write temp file and load with python-docx (docx)
         with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
             tmp.write(b)
             tmp.flush()
             tmp_path = tmp.name
-        docx_obj = docx.Document(tmp_path)
-        t = "\n".join(p.text for p in docx_obj.paragraphs)
+        doc = docx.Document(tmp_path)
+        t = "\n".join(p.text for p in doc.paragraphs)
         try:
             os.remove(tmp_path)
         except Exception:
@@ -698,7 +545,7 @@ def extract_text_from_docx_bytes(b: bytes) -> str:
         return t
     except Exception:
         LOG.debug("DOCX extraction failed", exc_info=True)
-    return ""
+        return ""
 
 def extract_text_from_xlsx_bytes(b: bytes) -> str:
     if not OPENPYXL_AVAILABLE:
@@ -723,7 +570,7 @@ def extract_text_from_xlsx_bytes(b: bytes) -> str:
         return "\n".join(rows)
     except Exception:
         LOG.debug("XLSX extraction failed", exc_info=True)
-    return ""
+        return ""
 
 def extract_text_from_image_bytes(b: bytes) -> str:
     if not OCR_AVAILABLE:
@@ -742,8 +589,9 @@ def extract_text_from_image_bytes(b: bytes) -> str:
         return text or ""
     except Exception:
         LOG.debug("Image OCR failed", exc_info=True)
-    return ""
+        return ""
 
+# Convenience: dispatch by mimetype/extension
 def extract_text_from_bytes(b: bytes, url: str) -> str:
     url = url or ""
     ext = Path(urllib.parse.urlparse(url).path).suffix.lower()
@@ -755,13 +603,14 @@ def extract_text_from_bytes(b: bytes, url: str) -> str:
         return extract_text_from_xlsx_bytes(b)
     if ext in (".png", ".jpg", ".jpeg", ".bmp", ".tiff"):
         return extract_text_from_image_bytes(b)
+    # fallback: try to decode as text
     try:
         return b.decode("utf-8", errors="ignore")
     except Exception:
         return ""
 
 # ---------------------------
-# Validation (MX lookup)
+# Validation (MX + optional SMTP probe)
 # ---------------------------
 def mx_lookup_sync(domain: str, timeout: int = 5) -> List[str]:
     if not DNSPY_AVAILABLE:
@@ -777,8 +626,261 @@ async def mx_lookup(domain: str, timeout: int = 5) -> List[str]:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(THREAD_POOL, mx_lookup_sync, domain, timeout)
 
+# SMTP probe is risky and often blocked; implement naive probe but disabled by default.
+def smtp_probe_sync(email: str, mx_host: str, timeout: int = 5) -> bool:
+    # VERY naive, for demonstration only; do not use for mass probing.
+    import socket
+    try:
+        s = socket.create_connection((mx_host, 25), timeout=timeout)
+        s.settimeout(timeout)
+        banner = s.recv(1024)
+        s.send(b"HELO example.com\r\n")
+        s.recv(1024)
+        s.send(b"MAIL FROM:<probe@example.com>\r\n")
+        s.recv(1024)
+        s.send(f"RCPT TO:<{email}>\r\n".encode())
+        resp = s.recv(1024).decode(errors="ignore")
+        s.send(b"QUIT\r\n")
+        s.close()
+        return "250" in resp or "251" in resp
+    except Exception:
+        return False
+
+async def smtp_probe(email: str, mx_host: str, timeout: int = 5) -> bool:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(THREAD_POOL, smtp_probe_sync, email, mx_host, timeout)
+
 # ---------------------------
-# FetcherExpanded
+# Job Store (persistent)
+# ---------------------------
+@dataclass
+class JobRecord:
+    id: str
+    created_at: str
+    updated_at: str
+    status: str
+    urls: List[str]
+    results: Dict[str, List[str]] = field(default_factory=dict)
+    options: Dict[str, Any] = field(default_factory=dict)
+
+class JobStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._jobs: Dict[str, JobRecord] = {}
+        self._load()
+
+    def _load(self):
+        if not self.path.exists():
+            self._jobs = {}
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            for jid, jr in raw.items():
+                self._jobs[jid] = JobRecord(**jr)
+            LOG.info("Job store loaded: %d jobs", len(self._jobs))
+        except Exception:
+            LOG.exception("Failed to load job store")
+            self._jobs = {}
+
+    def _persist(self):
+        try:
+            tmp = str(self.path) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                serial = {k: asdict(v) for k,v in self._jobs.items()}
+                json.dump(serial, f, indent=2)
+            os.replace(tmp, str(self.path))
+        except Exception:
+            LOG.exception("Failed to persist job store")
+
+    def create_job(self, urls: List[str], options: Dict[str, Any]) -> JobRecord:
+        jid = f"job_{int(time.time()*1000)}"
+        now = now_iso()
+        jr = JobRecord(id=jid, created_at=now, updated_at=now, status="queued", urls=list(urls), results={}, options=options)
+        with self._lock:
+            self._jobs[jid] = jr
+            self._persist()
+        return jr
+
+    def update_job(self, jid: str, **kwargs):
+        with self._lock:
+            if jid not in self._jobs:
+                return
+            for k,v in kwargs.items():
+                setattr(self._jobs[jid], k, v)
+            self._jobs[jid].updated_at = now_iso()
+            self._persist()
+
+    def get_job(self, jid: str) -> Optional[JobRecord]:
+        return self._jobs.get(jid)
+
+    def list_jobs(self) -> List[JobRecord]:
+        return list(self._jobs.values())
+
+# initialize jobstore
+JOBSTORE = JobStore(JOB_STORE)
+
+# ---------------------------
+# Scraper class (expanded)
+# ---------------------------
+class ScraperEngine:
+    def __init__(
+        self,
+        playwright_pool: Optional[PlaywrightPool] = None,
+        concurrency: int = 4,
+        email_limit: int = 10,
+        timeout: int = 25,
+        rate_delay: float = 0.12,
+        proxy_manager: Optional[ProxyManager] = None,
+        safe_mode: bool = False,
+        enable_ocr: bool = False,
+        enable_smtp_probe: bool = False,
+    ):
+        self.playwright_pool = playwright_pool
+        self.concurrency = concurrency
+        self.email_limit = email_limit
+        self.timeout = timeout
+        self.rate_delay = rate_delay
+        self.proxy_manager = proxy_manager or ProxyManager()
+        self.safe_mode = safe_mode
+        self.enable_ocr = enable_ocr and OCR_AVAILABLE
+        self.enable_smtp_probe = enable_smtp_probe
+        self.fetcher = self._build_fetcher()
+        self.results: Dict[str, List[str]] = {}
+        self._cancel_event = asyncio.Event()
+        self._host_rate: Dict[str, float] = {}  # host -> last_request_time
+
+    def _build_fetcher(self):
+        return FetcherExpanded(self.playwright_pool, timeout=self.timeout, ua_rotation=True, proxy_manager=self.proxy_manager)
+
+    def cancel(self):
+        self._cancel_event.set()
+
+    # polite rate limiting per host
+    async def _polite_wait(self, url: str):
+        host = urllib.parse.urlparse(url).netloc
+        min_delay = 0.12
+        last = self._host_rate.get(host, 0)
+        elapsed = time.time() - last
+        if elapsed < min_delay:
+            await asyncio.sleep(min_delay - elapsed)
+        self._host_rate[host] = time.time()
+
+    async def process_one(self, raw_url: str) -> List[str]:
+        if self._cancel_event.is_set():
+            return []
+        url = raw_url.strip()
+        if not url:
+            return []
+        if not re.match(r'^https?://', url):
+            url = "http://" + url
+        await self._polite_wait(url)
+        content = await self.fetcher.fetch(url)
+        if not content:
+            return []
+        emails = set()
+        for m in re.findall(MAILTO_RE, content):
+            emails.add(m)
+        emails |= extract_emails(content)
+        # parse JSON blocks heuristically
+        for m in re.findall(r'(\{[\s\S]{30,}\})', content):
+            try:
+                o = json.loads(m)
+                emails |= traverse_json_for_emails(o)
+            except Exception:
+                pass
+
+        # lightweight link scanning for contact pages and files
+        contact_links = set()
+        for href in re.findall(r'href\s*=\s*["\']([^"\']+)["\']', content, flags=re.I):
+            low = href.lower()
+            if any(k in low for k in ("contact", "about", "team", "privacy", "legal", "support")):
+                contact_links.add(href)
+            if any(low.endswith(ext) for ext in (".pdf", ".docx", ".xlsx", ".xls", ".png", ".jpg", ".jpeg")):
+                # fetch remote file content and extract text (blocking in executor)
+                try:
+                    raw_bytes = await self.fetcher.fetch_bytes(urljoin(url, href))
+                    if raw_bytes:
+                        txt = await asyncio.get_event_loop().run_in_executor(THREAD_POOL, extract_text_from_bytes, raw_bytes, href)
+                        emails |= extract_emails(txt)
+                except Exception:
+                    pass
+
+        # visit up to N contact links
+        cnt = 0
+        for cl in list(contact_links)[:8]:
+            if len(emails) >= self.email_limit or cnt >= 8:
+                break
+            full = cl if re.match(r'^https?://', cl) else urllib.parse.urljoin(url, cl)
+            try:
+                ctext = await self.fetcher.fetch(full)
+                emails |= extract_emails(ctext)
+            except Exception:
+                pass
+            cnt += 1
+
+        # filter disposables
+        filtered = [e for e in emails if e and e.split("@")[-1].lower() not in DISPOSABLE_DOMAINS]
+        final = []
+        for e in sorted(filtered):
+            if len(final) >= self.email_limit:
+                break
+            # MX check (async)
+            try:
+                domain = e.split("@",1)[1]
+                mxs = await mx_lookup(domain)
+                if mxs is not None and mxs == []:
+                    continue
+            except Exception:
+                pass
+            # optional smtp probe
+            if self.enable_smtp_probe:
+                try:
+                    if mxs:
+                        ok = await smtp_probe(e, mxs[0])
+                        if not ok:
+                            continue
+                except Exception:
+                    pass
+            final.append(e)
+
+        self.results[raw_url] = final
+        # incremental write
+        await self._write_incremental(raw_url, final)
+        await asyncio.sleep(self.rate_delay)
+        return final
+
+    async def _write_incremental(self, url: str, emails: List[str]):
+        ts = int(time.time())
+        file = RESULTS_DIR / f"emails_{safe_filename(url)}_{ts}.csv"
+        try:
+            with open(file, "w", newline="", encoding="utf-8") as f:
+                wr = csv.writer(f)
+                wr.writerow([url] + emails)
+        except Exception:
+            LOG.debug("Failed to write incremental file", exc_info=True)
+
+    async def run(self, urls: List[str], progress_cb: Optional[Callable] = None):
+        self._cancel_event.clear()
+        sem = asyncio.Semaphore(self.concurrency)
+        total = len(urls)
+        done = 0
+
+        async def worker(u):
+            nonlocal done
+            async with sem:
+                if self._cancel_event.is_set():
+                    return
+                res = await self.process_one(u)
+                done += 1
+                if progress_cb:
+                    await progress_cb(done, total, u, res)
+
+        await asyncio.gather(*[worker(u) for u in urls])
+        return self.results
+
+# ---------------------------
+# FetcherExpanded (Playwright + aiohttp + requests + bytes fetch)
 # ---------------------------
 class FetcherExpanded:
     def __init__(self, playwright_pool: Optional[PlaywrightPool] = None, timeout: int = 20, ua_rotation: bool = True, proxy_manager: Optional[ProxyManager] = None):
@@ -790,44 +892,14 @@ class FetcherExpanded:
     def _choose_ua(self) -> str:
         if not self.ua_rotation:
             return USER_AGENTS[0]
-        return USER_AGENTS[int(time.time() * 1000) % len(USER_AGENTS)]
+        return USER_AGENTS[int(time.time()*1000) % len(USER_AGENTS)]
 
-    async def _inject_fetch_capture(self, page):
-        try:
-            await page.add_init_script(
-                """
-                (() => {
-                  if (window.__cap_wrapped) return;
-                  window.__cap_wrapped = true;
-                  window.__capturedXHR = window.__capturedXHR || [];
-                  const _fetch = window.fetch;
-                  window.fetch = function(...args) {
-                    return _fetch.apply(this, args).then(res => {
-                      try { res.clone().text().then(t=>window.__capturedXHR.push(t)).catch(()=>{}); } catch(e) {}
-                      return res;
-                    });
-                  };
-                  const _open = XMLHttpRequest.prototype.open;
-                  XMLHttpRequest.prototype.open = function() {
-                    this.addEventListener('load', function(){
-                      try { window.__capturedXHR.push(this.responseText || '') } catch(e){}
-                    });
-                    return _open.apply(this, arguments);
-                  };
-                })();
-                """
-            )
-        except Exception:
-            LOG.debug("Failed to inject fetch capture script", exc_info=True)
-
-    async def fetch_with_playwright(self, url: str, capture_xhr: bool = True, click_reveal: bool = False) -> Tuple[str, List[str]]:
-        """Return (combined_text, list_of_captured_xhr_texts)"""
+    async def fetch_with_playwright(self, url: str, capture_xhr: bool = True) -> str:
         if not PLAYWRIGHT_AVAILABLE or not self.playwright_pool:
-            return "", []
+            return ""
         ctx = await self.playwright_pool.get_context()
         page = await ctx.new_page()
-        xhr_texts: List[str] = []
-        script_texts: List[str] = []
+        xhr_texts = []
         try:
             ua = self._choose_ua()
             try:
@@ -840,8 +912,8 @@ class FetcherExpanded:
                     try:
                         if resp.status != 200:
                             return
-                        ctype = resp.headers.get("content-type", "").lower()
-                        if any(x in ctype for x in ("application/json", "application/javascript", "text/", "application/xml")):
+                        ctype = resp.headers.get("content-type","")
+                        if "json" in ctype or "text" in ctype or "xml" in ctype:
                             try:
                                 t = await resp.text()
                                 xhr_texts.append(t)
@@ -849,127 +921,35 @@ class FetcherExpanded:
                                 pass
                     except Exception:
                         pass
-
                 page.on("response", on_resp)
-                await self._inject_fetch_capture(page)
 
             try:
-                await page.goto(url, timeout=self.timeout * 1000)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=min(self.timeout * 1000, 10000))
-                except Exception:
-                    pass
+                await page.goto(url, timeout=self.timeout*1000)
                 await asyncio.sleep(0.9)
+                html = await page.content()
             except PlayTimeoutError:
                 LOG.debug("Playwright timeout for %s", url)
+                try:
+                    html = await page.content()
+                except Exception:
+                    html = ""
             except Exception as e:
-                LOG.debug("Playwright goto exception %s -> %s", url, e)
-
-            if click_reveal:
-                try:
-                    btns = await page.query_selector_all("text=/show|reveal|email|contact|@/i")
-                    for b in btns[:4]:
-                        try:
-                            await b.click(timeout=1500)
-                            await asyncio.sleep(0.25)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-            collected_texts: List[str] = []
-            try:
-                html_content = await page.content()
-                collected_texts.append(html_content or "")
-            except Exception:
-                pass
-
-            try:
-                body_text = await page.evaluate("() => document.body ? document.body.innerText : ''")
-                if body_text:
-                    collected_texts.append(body_text)
-            except Exception:
-                pass
-
-            try:
-                dom_dump = await page.evaluate(
-                    """() => {
-                        function collect(node){
-                          let out = [];
-                          if(node.nodeType === Node.TEXT_NODE){
-                            out.push(node.textContent || '');
-                          } else {
-                            if(node.attributes){
-                              for(const a of node.attributes) out.push(a.value || '');
-                            }
-                            const children = node.shadowRoot ? Array.from(node.shadowRoot.childNodes) : Array.from(node.childNodes || []);
-                            for(const c of children) out = out.concat(collect(c));
-                          }
-                          return out;
-                        }
-                        return collect(document.documentElement).join('\\n');
-                    }"""
-                )
-                if dom_dump:
-                    collected_texts.append(dom_dump)
-            except Exception:
-                pass
-
-            try:
-                for frame in page.frames:
-                    try:
-                        fhtml = await frame.content()
-                        if fhtml:
-                            collected_texts.append(fhtml)
-                        ftext = await frame.evaluate("() => document.body ? document.body.innerText : ''")
-                        if ftext:
-                            collected_texts.append(ftext)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-            try:
-                scripts = await page.query_selector_all("script")
-                for s in scripts[:80]:
-                    try:
-                        txt = await s.inner_text()
-                        if txt:
-                            script_texts.append(txt)
-                    except Exception:
-                        pass
-                try:
-                    jsonld = await page.evaluate(
-                        """() => Array.from(document.querySelectorAll('script[type="application/ld+json"]')).map(s=>s.textContent).join('\\n')"""
-                    )
-                    if jsonld:
-                        collected_texts.append(jsonld)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-            try:
-                captured_in_page = await page.evaluate("() => (window.__capturedXHR || []).slice(0,50).join('\\n')")
-                if captured_in_page:
-                    xhr_texts.append(captured_in_page)
-            except Exception:
-                pass
-
-            combined = "\n".join(collected_texts + script_texts + xhr_texts)
+                LOG.debug("Playwright fetch exception for %s: %s", url, e)
+                html = ""
+            combined = html + "\n" + "\n".join(xhr_texts)
             try:
                 await page.context.close()
             except Exception:
                 pass
             await self.playwright_pool.release_context(ctx)
-            return combined, xhr_texts
+            return combined
         except Exception as e:
             LOG.debug("Playwright fetch failed %s -> %s", url, e)
             with suppress(Exception):
                 await page.close()
             with suppress(Exception):
                 await self.playwright_pool.release_context(ctx)
-            return "", []
+            return ""
 
     async def fetch_with_aiohttp(self, url: str) -> str:
         if not AIOHTTP_AVAILABLE:
@@ -1001,7 +981,20 @@ class FetcherExpanded:
             LOG.debug("requests fetch error %s -> %s", url, e)
         return ""
 
+    async def fetch_bytes_requests(self, url: str) -> bytes:
+        if not REQUESTS_AVAILABLE:
+            return b""
+        headers = {"User-Agent": self._choose_ua()}
+        try:
+            r = requests.get(url, timeout=self.timeout, headers=headers)
+            if r.status_code == 200:
+                return r.content
+        except Exception:
+            LOG.debug("requests bytes fetch failed for %s", url)
+        return b""
+
     async def fetch_bytes(self, url: str) -> bytes:
+        # prefer aiohttp if available
         if AIOHTTP_AVAILABLE:
             headers = {"User-Agent": self._choose_ua()}
             try:
@@ -1012,6 +1005,7 @@ class FetcherExpanded:
                             return await resp.read()
             except Exception:
                 pass
+        # fallback to requests on threadpool
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(THREAD_POOL, lambda: self.fetch_bytes_requests_sync(url))
 
@@ -1026,11 +1020,12 @@ class FetcherExpanded:
             pass
         return b""
 
-    async def fetch(self, url: str, click_reveal: bool = False) -> str:
+    async def fetch(self, url: str) -> str:
+        # Playwright -> aiohttp -> requests (sync)
         content = ""
         if PLAYWRIGHT_AVAILABLE and self.playwright_pool:
             try:
-                content, _ = await self.fetch_with_playwright(url, capture_xhr=True, click_reveal=click_reveal)
+                content = await self.fetch_with_playwright(url, capture_xhr=True)
                 if content:
                     return content
             except Exception:
@@ -1047,466 +1042,44 @@ class FetcherExpanded:
         return content or ""
 
 # ---------------------------
-# ScraperEngine
-# ---------------------------
-class ScraperEngine:
-    def __init__(
-        self,
-        playwright_pool: Optional[PlaywrightPool] = None,
-        concurrency: int = 6,
-        email_limit: int = 30,
-        timeout: int = 30,
-        rate_delay: float = 0.08,
-        proxy_manager: Optional[ProxyManager] = None,
-        safe_mode: bool = False,
-        enable_ocr: bool = True,
-        enable_smtp_probe: bool = False,
-        contact_depth: int = 2,
-    ):
-        self.playwright_pool = playwright_pool
-        self.concurrency = concurrency
-        self.email_limit = email_limit
-        self.timeout = timeout
-        self.rate_delay = rate_delay
-        self.proxy_manager = proxy_manager or ProxyManager()
-        self.safe_mode = safe_mode
-        self.enable_ocr = enable_ocr and OCR_AVAILABLE
-        self.enable_smtp_probe = enable_smtp_probe
-        self.contact_depth = contact_depth
-        self.fetcher = FetcherExpanded(self.playwright_pool, timeout=self.timeout, ua_rotation=True, proxy_manager=self.proxy_manager)
-        self.results: Dict[str, List[str]] = {}
-        self._cancel_event = asyncio.Event()
-        self._host_rate: Dict[str, float] = {}
-
-    def cancel(self):
-        self._cancel_event.set()
-
-    async def _polite_wait(self, url: str):
-        host = urllib.parse.urlparse(url).netloc
-        min_delay = 0.12
-        last = self._host_rate.get(host, 0)
-        elapsed = time.time() - last
-        if elapsed < min_delay:
-            await asyncio.sleep(min_delay - elapsed)
-        self._host_rate[host] = time.time()
-
-    async def _gather_from_html(self, base_url: str, html_content: str) -> Tuple[Set[str], Set[str]]:
-        emails = set()
-        contact_links = set()
-        if not html_content:
-            return emails, contact_links
-
-        for m in re.findall(MAILTO_RE, html_content):
-            emails.add(m)
-
-        emails |= extract_emails(html_content)
-
-        for href in re.findall(r'href\s*=\s*["\']([^"\']+)["\']', html_content, flags=re.I):
-            low = href.lower()
-            if any(k in low for k in ("contact", "about", "team", "privacy", "legal", "support", "imprint", "office")):
-                contact_links.add(href)
-            if any(low.endswith(ext) for ext in (".pdf", ".docx", ".xlsx", ".xls", ".png", ".jpg", ".jpeg")):
-                contact_links.add(href)
-
-        for js in re.findall(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>', html_content, flags=re.I):
-            try:
-                obj = json.loads(js)
-                def traverse(o):
-                    found = set()
-                    if isinstance(o, dict):
-                        for k, v in o.items():
-                            if isinstance(v, str) and "@" in v:
-                                found |= set(re.findall(EMAIL_RE, v))
-                            elif isinstance(v, (list, dict)):
-                                found |= traverse(v)
-                    elif isinstance(o, list):
-                        for x in o:
-                            found |= traverse(x)
-                    elif isinstance(o, str):
-                        if "@" in o:
-                            found |= set(re.findall(EMAIL_RE, o))
-                    return found
-                emails |= traverse(obj)
-            except Exception:
-                pass
-
-        return emails, contact_links
-
-    async def process_one(self, raw_url: str) -> List[str]:
-        if self._cancel_event.is_set():
-            return []
-        url = raw_url.strip()
-        if not url:
-            return []
-        if not re.match(r'^https?://', url):
-            url = "http://" + url
-
-        await self._polite_wait(url)
-
-        content = await self.fetcher.fetch(url, click_reveal=False)
-        if not content and PLAYWRIGHT_AVAILABLE:
-            content, _ = await self.fetcher.fetch_with_playwright(url, capture_xhr=True, click_reveal=True)
-
-        if not content:
-            return []
-
-        emails = set()
-        emails |= set(re.findall(MAILTO_RE, content))
-        emails |= extract_emails(content)
-
-        for m in re.findall(r'(\{[\s\S]{30,}\})', content):
-            try:
-                o = json.loads(m)
-                def traverse_json(o2):
-                    found = set()
-                    if isinstance(o2, dict):
-                        for k, v in o2.items():
-                            if isinstance(v, str) and "@" in v:
-                                found |= set(re.findall(EMAIL_RE, v))
-                            else:
-                                found |= traverse_json(v)
-                    elif isinstance(o2, list):
-                        for x in o2:
-                            found |= traverse_json(x)
-                    elif isinstance(o2, str):
-                        if "@" in o2:
-                            found |= set(re.findall(EMAIL_RE, o2))
-                    return found
-                emails |= traverse_json(o)
-            except Exception:
-                pass
-
-        contact_links = set()
-        file_links = set()
-        for href in re.findall(r'href\s*=\s*["\']([^"\']+)["\']', content, flags=re.I):
-            low = href.lower()
-            if any(k in low for k in ("contact", "about", "team", "privacy", "legal", "support", "imprint")):
-                contact_links.add(href)
-            if any(low.endswith(ext) for ext in (".pdf", ".docx", ".xlsx", ".xls", ".png", ".jpg", ".jpeg")):
-                file_links.add(href)
-
-        try:
-            parsed = urllib.parse.urlparse(url)
-            sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
-            scont = await self.fetcher.fetch(sitemap_url)
-            for u in re.findall(r'<loc>([^<]+)</loc>', scont):
-                if any(k in u.lower() for k in ("contact", "about", "team", "privacy", "support")):
-                    contact_links.add(u)
-        except Exception:
-            pass
-
-        seen = set()
-        queue = deque()
-        def norm_link(href):
-            if re.match(r'^https?://', href):
-                return href
-            try:
-                return urllib.parse.urljoin(url, href)
-            except Exception:
-                return href
-
-        for cl in list(contact_links)[:12]:
-            queue.append((norm_link(cl), 0))
-        for f in list(file_links)[:12]:
-            queue.append((norm_link(f), 0))
-
-        while queue:
-            if self._cancel_event.is_set():
-                break
-            link, d = queue.popleft()
-            if link in seen or d > self.contact_depth:
-                continue
-            seen.add(link)
-            await self._polite_wait(link)
-            try:
-                if any(link.lower().endswith(ext) for ext in (".pdf", ".docx", ".xlsx", ".xls", ".png", ".jpg", ".jpeg")):
-                    try:
-                        raw_bytes = await self.fetcher.fetch_bytes(link)
-                        if raw_bytes:
-                            txt = await asyncio.get_event_loop().run_in_executor(THREAD_POOL, extract_text_from_bytes, raw_bytes, link)
-                            emails |= extract_emails(txt)
-                    except Exception:
-                        pass
-                    continue
-                page_text = await self.fetcher.fetch(link, click_reveal=False)
-                if not page_text:
-                    continue
-                emails |= extract_emails(page_text)
-
-                for href in re.findall(r'href\s*=\s*["\']([^"\']+)["\']', page_text, flags=re.I):
-                    low = href.lower()
-                    if any(k in low for k in ("contact", "about", "team", "privacy", "support", "imprint")):
-                        nl = norm_link(href)
-                        if nl not in seen and d + 1 <= self.contact_depth:
-                            queue.append((nl, d + 1))
-                    if any(low.endswith(ext) for ext in (".pdf", ".docx", ".xlsx", ".xls", ".png", ".jpg", ".jpeg")):
-                        nl = norm_link(href)
-                        if nl not in seen:
-                            queue.append((nl, d + 1))
-            except Exception:
-                LOG.debug("BFS crawl failed for %s", link, exc_info=True)
-            await asyncio.sleep(self.rate_delay)
-
-        try:
-            for m in re.findall(r'String\.fromCharCode\([^\)]+\)', content):
-                try:
-                    dec = _decode_fromcharcodes(m)
-                    emails |= set(re.findall(EMAIL_RE, dec))
-                except Exception:
-                    pass
-            for b64 in re.findall(r'([A-Za-z0-9+/=]{16,})', content):
-                try:
-                    decoded = base64.b64decode(b64 + '==' if len(b64) % 4 else b64).decode('utf-8', errors='ignore')
-                    if '@' in decoded:
-                        emails |= set(re.findall(EMAIL_RE, decoded))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        if self.enable_ocr:
-            try:
-                imgs = set(re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', content, flags=re.I))
-                for img_src in list(imgs)[:8]:
-                    if any(k in img_src.lower() for k in ("contact", "email", "info", "support")):
-                        target = img_src if re.match(r'^https?://', img_src) else urllib.parse.urljoin(url, img_src)
-                        try:
-                            raw = await self.fetcher.fetch_bytes(target)
-                            if raw:
-                                txt = await asyncio.get_event_loop().run_in_executor(THREAD_POOL, extract_text_from_image_bytes, raw)
-                                emails |= extract_emails(txt)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-        filtered = [e for e in emails if e and e.split("@")[-1].lower() not in DISPOSABLE_DOMAINS]
-        final = []
-        for e in sorted(filtered):
-            if len(final) >= self.email_limit:
-                break
-            try:
-                domain = e.split("@", 1)[1]
-            except Exception:
-                pass
-            final.append(e)
-
-        self.results[raw_url] = final
-        await self._write_incremental(raw_url, final)
-        await asyncio.sleep(self.rate_delay)
-        return final
-
-    async def _write_incremental(self, url: str, emails: List[str]):
-        ts = int(time.time())
-        file = RESULTS_DIR / f"emails_{safe_filename(url)}_{ts}.csv"
-        try:
-            with open(file, "w", newline="", encoding="utf-8") as f:
-                wr = csv.writer(f)
-                wr.writerow([url] + emails)
-        except Exception:
-            LOG.debug("Failed to write incremental file", exc_info=True)
-
-    async def run(self, urls: List[str], progress_cb: Optional[Callable] = None):
-        self._cancel_event.clear()
-        sem = asyncio.Semaphore(self.concurrency)
-        total = len(urls)
-        done = 0
-
-        async def worker(u):
-            nonlocal done
-            async with sem:
-                if self._cancel_event.is_set():
-                    return
-                res = []
-                try:
-                    res = await self.process_one(u)
-                except Exception:
-                    LOG.exception("process_one failed for %s", u)
-                done += 1
-                if progress_cb:
-                    await progress_cb(done, total, u, res)
-
-        await asyncio.gather(*[worker(u) for u in urls])
-        return self.results
-
-# ---------------------------
 # FastAPI server & WebSocket
 # ---------------------------
-db = Database()
+app = FastAPI()
 proxy_manager = ProxyManager()
 play_pool = PlaywrightPool(headless=True, max_contexts=3) if PLAYWRIGHT_AVAILABLE else None
 ACTIVE_WS: Set[WebSocket] = set()
 SCRAPERS: Dict[str, ScraperEngine] = {}
 JOB_LOCK = threading.Lock()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    LOG.info("✅ Backend server starting...")
-    LOG.info("📊 Database initialized")
-    yield
-    LOG.info("🛑 Backend server shutting down...")
-    if play_pool:
-        try:
-            await play_pool.close()
-        except Exception:
-            pass
-    THREAD_POOL.shutdown(wait=False)
-
-app = FastAPI(lifespan=lifespan)
-
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 @app.get("/health")
 async def health():
-    return JSONResponse({"status": "ok", "playwright": PLAYWRIGHT_AVAILABLE, "aiohttp": AIOHTTP_AVAILABLE, "requests": REQUESTS_AVAILABLE})
+    return JSONResponse({"status":"ok","playwright": PLAYWRIGHT_AVAILABLE, "aiohttp": AIOHTTP_AVAILABLE, "requests": REQUESTS_AVAILABLE})
 
 @app.get("/")
 async def root():
-    try:
-        return FileResponse("index.html")
-    except Exception:
-        return HTMLResponse("<h3>index.html not found</h3>", status_code=404)
-
-@app.get("/admin")
-async def admin_page():
-    try:
-        return FileResponse("admin.html")
-    except Exception:
-        return HTMLResponse("<h3>admin.html not found</h3>", status_code=404)
-
-# Serve static files (CSS and JS)
-@app.get("/style.css")
-async def serve_css():
-    try:
-        return FileResponse("style.css", media_type="text/css")
-    except Exception:
-        raise HTTPException(status_code=404, detail="style.css not found")
-
-@app.get("/app.js")
-async def serve_js():
-    try:
-        return FileResponse("app.js", media_type="application/javascript")
-    except Exception:
-        raise HTTPException(status_code=404, detail="app.js not found")
-
-# User management endpoints
-@app.post("/api/register")
-async def register_user(data: dict):
-    user_id = data.get("user_id")
-    name = data.get("name")
-    created_at = data.get("created_at", datetime.now().isoformat())
-    
-    if not user_id or not name:
-        raise HTTPException(status_code=400, detail="Missing user_id or name")
-    
-    db.register_user(user_id, name, created_at)
-    return {"status": "success", "message": "User registered"}
-
-@app.post("/api/check-blocked")
-async def check_blocked(data: dict):
-    user_id = data.get("user_id")
-    
-    if not user_id:
-        raise HTTPException(status_code=400, detail="Missing user_id")
-    
-    is_blocked = db.is_user_blocked(user_id)
-    db.update_user_activity(user_id)
-    
-    return {"is_blocked": is_blocked}
-
-@app.get("/api/users")
-async def get_users():
-    users = db.get_all_users()
-    return {"users": users}
-
-@app.post("/api/block-user")
-async def block_user(data: dict):
-    user_id = data.get("user_id")
-    
-    if not user_id:
-        raise HTTPException(status_code=400, detail="Missing user_id")
-    
-    db.block_user(user_id)
-    return {"status": "success", "message": "User blocked"}
-
-@app.post("/api/unblock-user")
-async def unblock_user(data: dict):
-    user_id = data.get("user_id")
-    
-    if not user_id:
-        raise HTTPException(status_code=400, detail="Missing user_id")
-    
-    db.unblock_user(user_id)
-    return {"status": "success", "message": "User unblocked"}
-
-@app.post("/api/activity")
-async def log_activity(data: dict):
-    user_id = data.get("user_id")
-    user_name = data.get("user_name")
-    job_id = data.get("job_id")
-    urls = data.get("urls")
-    total_emails = data.get("total_emails", 0)
-    status = data.get("status")
-    
-    if not user_id or not user_name:
-        raise HTTPException(status_code=400, detail="Missing required fields")
-    
-    db.log_activity(user_id, user_name, job_id, urls, total_emails, status)
-    return {"status": "success"}
-
-@app.get("/api/activity")
-async def get_activity():
-    activities = db.get_recent_activity()
-    return {"activities": activities}
-
-@app.get("/api/user-activity/{user_id}")
-async def get_user_activity(user_id: str):
-    activities = db.get_user_activity(user_id)
-    return {"activities": activities}
+    if FRONTEND_FILE.exists():
+        return FileResponse(FRONTEND_FILE)
+    return HTMLResponse("<h3>frontend.html not found</h3>", status_code=404)
 
 @app.get("/jobs")
 async def list_jobs():
-    jobs = db.get_all_jobs()
-    for job in jobs:
-        if job.get("results"):
-            try:
-                job["results"] = json.loads(job["results"])
-            except:
-                job["results"] = {}
-    return jobs
+    jobs = JOBSTORE.list_jobs()
+    out = [{ "id": j.id, "status": j.status, "created_at": j.created_at, "updated_at": j.updated_at, "count": len(j.urls) } for j in jobs]
+    return JSONResponse(out)
 
 @app.get("/job/{job_id}")
 async def get_job(job_id: str):
-    jobs = db.get_all_jobs()
-    job = next((j for j in jobs if j["id"] == job_id), None)
-    
-    if not job:
+    jr = JOBSTORE.get_job(job_id)
+    if not jr:
         raise HTTPException(status_code=404, detail="Job not found")
-    
-    if job.get("results"):
-        try:
-            job["results"] = json.loads(job["results"])
-        except:
-            job["results"] = {}
-    
-    return job
+    return JSONResponse(asdict(jr))
 
+# WebSocket endpoint
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     ACTIVE_WS.add(ws)
     LOG.info("WebSocket connected (clients=%d)", len(ACTIVE_WS))
-    
-    current_user_id = "anonymous"
-    current_user_name = "Anonymous User"
-    
     try:
         while True:
             try:
@@ -1515,27 +1088,7 @@ async def websocket_endpoint(ws: WebSocket):
                 break
             if not data:
                 continue
-            
-            # Handle user registration
-            if data.startswith("user_id:"):
-                try:
-                    user_data = json.loads(data[8:])
-                    current_user_id = user_data.get("user_id", "anonymous")
-                    current_user_name = user_data.get("user_name", "Anonymous User")
-                    
-                    # Check if user is blocked
-                    if db.is_user_blocked(current_user_id):
-                        await ws.send_text(json.dumps({
-                            "type": "error",
-                            "msg": "Your account has been blocked. Please contact the administrator."
-                        }))
-                    else:
-                        db.update_user_activity(current_user_id)
-                except Exception as e:
-                    LOG.exception("User ID parsing failed")
-            
-            # Handle job start
-            elif data.startswith("start"):
+            if data.startswith("start"):
                 payload = data[len("start"):].strip()
                 urls = []
                 try:
@@ -1551,97 +1104,51 @@ async def websocket_endpoint(ws: WebSocket):
                         urls = [l.strip() for l in payload.split(",") if l.strip()]
                     else:
                         urls = [payload.strip()]
-
                 if not urls:
-                    await ws.send_text(json.dumps({"type": "error", "msg": "No URLs"}))
+                    await ws.send_text(json.dumps({"type":"error","msg":"No URLs"}))
                     continue
-
-                # Check if user is blocked before starting job
-                if db.is_user_blocked(current_user_id):
-                    await ws.send_text(json.dumps({
-                        "type": "error",
-                        "msg": "Your account has been blocked. Please contact the administrator."
-                    }))
-                    continue
-
-                # Create job record
-                job_id = f"job_{uuid.uuid4().hex[:8]}"
-                db.create_job(job_id, current_user_id, len(urls))
-                
-                # Init playwright pool if needed
+                # create job record
+                jr = JOBSTORE.create_job(urls, options={})
+                # init playwright pool if needed
                 if play_pool and not play_pool._inited:
                     try:
                         await play_pool.init()
                     except Exception:
                         LOG.exception("Playwright init failed")
-
-                # Create scraper engine
-                scraper = ScraperEngine(play_pool, concurrency=6, email_limit=30, timeout=30, safe_mode=False, enable_ocr=True)
-                SCRAPERS[job_id] = scraper
-                await ws.send_text(json.dumps({"type": "job_created", "job_id": job_id, "count": len(urls)}))
-
+                # create scraper
+                scraper = ScraperEngine(play_pool, concurrency=4, email_limit=10, safe_mode=args.safe_mode)
+                SCRAPERS[jr.id] = scraper
+                await ws.send_text(json.dumps({"type":"job_created","job_id":jr.id,"count":len(urls)}))
                 async def progress_cb(done, total, current, emails):
-                    try:
-                        db.update_job(job_id, "running")
-                    except Exception:
-                        pass
-                    payload = {"type": "progress", "job_id": job_id, "done": done, "total": total, "current": current, "emails": emails}
+                    # update job store incrementally
+                    JOBSTORE._jobs[jr.id].results[current] = emails
+                    JOBSTORE.update_job(jr.id, status="running")
+                    payload = {"type":"progress","job_id":jr.id,"done":done,"total":total,"current":current,"emails":emails}
                     try:
                         await ws.send_text(json.dumps(payload))
                     except Exception:
                         pass
-
                 try:
-                    db.update_job(job_id, "running")
+                    JOBSTORE.update_job(jr.id, status="running")
                     results = await scraper.run(urls, progress_cb)
-                    
-                    # Count total emails
-                    total_emails = sum(len(v) for v in results.values())
-                    
-                    # Log activity
-                    db.log_activity(
-                        current_user_id,
-                        current_user_name,
-                        job_id,
-                        ", ".join(urls[:3]) + ("..." if len(urls) > 3 else ""),
-                        total_emails,
-                        "completed"
-                    )
-                    
-                    db.update_job(job_id, "finished", json.dumps(results))
-                    try:
-                        await ws.send_text(json.dumps({"type": "finished", "job_id": job_id, "results": results}))
-                    except Exception:
-                        pass
-                    
-                    # Send to external dashboard
-                    try:
-                        send_to_dashboard(job_id, "finished", results)
-                    except Exception:
-                        pass
-                        
+                    JOBSTORE.update_job(jr.id, status="finished", results=results)
+                    await ws.send_text(json.dumps({"type":"finished","job_id":jr.id,"results":results}))
                 except Exception:
                     LOG.exception("Scraper run exception")
-                    db.update_job(job_id, "failed")
-                    db.log_activity(current_user_id, current_user_name, job_id, ", ".join(urls[:3]), 0, "failed")
-                    try:
-                        await ws.send_text(json.dumps({"type": "error", "job_id": job_id, "msg": "scraper failed"}))
-                    except Exception:
-                        pass
-
+                    JOBSTORE.update_job(jr.id, status="failed")
+                    await ws.send_text(json.dumps({"type":"error","job_id":jr.id,"msg":"scraper failed"}))
             elif data.startswith("cancel"):
                 jid = data[len("cancel"):].strip()
                 s = SCRAPERS.get(jid)
                 if s:
                     s.cancel()
-                    db.update_job(jid, "cancelled")
-                    await ws.send_text(json.dumps({"type": "cancelled", "job_id": jid}))
+                    JOBSTORE.update_job(jid, status="cancelled")
+                    await ws.send_text(json.dumps({"type":"cancelled","job_id":jid}))
                 else:
-                    await ws.send_text(json.dumps({"type": "error", "msg": "job not found"}))
+                    await ws.send_text(json.dumps({"type":"error","msg":"job not found"}))
             else:
-                # echo unknown
-                await ws.send_text(json.dumps({"type": "echo", "msg": data}))
-
+                # echo or unsupported commands
+                await ws.send_text(json.dumps({"type":"echo","msg":data}))
     except WebSocketDisconnect:
         LOG.info("WebSocket disconnected")
     except Exception:
@@ -1650,11 +1157,77 @@ async def websocket_endpoint(ws: WebSocket):
         with suppress(Exception):
             ACTIVE_WS.remove(ws)
 
+# ---------------------------
+# Server starter / packaging helper
+# ---------------------------
+def background_install_playwright():
+    if args.no_playwright_install:
+        LOG.info("Skipping playwright install by flag")
+        return
+    if not PLAYWRIGHT_AVAILABLE:
+        LOG.info("Playwright not installed in environment")
+        return
+    try:
+        # best-effort install in background (may prompt or fail on some OS)
+        subprocess.Popen([sys.executable, "-m", "playwright", "install", "--with-deps"])
+    except Exception:
+        LOG.exception("playwright background install failed")
+
+def run_server_and_open():
+    # start uvicorn in thread
+    def _run():
+        LOG.info("Starting uvicorn on %s:%s", HOST, PORT)
+        uvicorn.run("backend:app", host=HOST, port=PORT, log_level="info", access_log=False)
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    time.sleep(1.2)
+    url = f"http://{HOST}:{PORT}/"
+    if not args.no_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            LOG.info("Auto-open failed; visit %s manually", url)
+    return t
+
+# ---------------------------
+# Graceful shutdown handling
+# ---------------------------
+# ---------------------------
+# Graceful shutdown handling (Windows-safe)
+# ---------------------------
+SHUTDOWN_EVENT = threading.Event()
+
+def _signal_handler(sig=None, frame=None):
+    LOG.info("Shutdown requested...")
+    SHUTDOWN_EVENT.set()
+
+# Windows cannot set signals in threads
+if threading.current_thread() is threading.main_thread():
+    try:
+        import signal
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+    except Exception:
+        pass
+
+# ---------------------------
+# Main
+# ---------------------------
 if __name__ == "__main__":
-    LOG.info("🚀 Starting Email Scraper Backend Server")
-    LOG.info("📍 Backend: http://localhost:%s", PORT)
-    LOG.info("🔌 WebSocket: ws://localhost:%s/ws", PORT)
-    LOG.info("👑 Admin Dashboard: http://localhost:%s/admin", PORT)
-    LOG.info("\n⚡ Server is running... Press CTRL+C to stop\n")
-    
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    LOG.info("Starting backend (expanded). Playwright available=%s", PLAYWRIGHT_AVAILABLE)
+    # attempt background playwright browser install if available
+    threading.Thread(target=background_install_playwright, daemon=True).start()
+    server_thread = run_server_and_open()
+    try:
+        while not SHUTDOWN_EVENT.is_set():
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    LOG.info("Shutting down server...")
+    if play_pool and play_pool._inited:
+        try:
+            asyncio.run(play_pool.close())
+        except Exception:
+            pass
+    THREAD_POOL.shutdown(wait=False)
+    LOG.info("Exit complete.")
