@@ -1,7 +1,10 @@
 #!/bin/bash
-echo "Installing Playwright browsers..."
-playwright install --with-deps chromium || true
+echo "======================================"
+echo "Starting Railway Email Scraper Backend"
+echo "======================================"
 
-echo "Starting backend..."
-uvicorn backend:app --host 0.0.0.0 --port $PORT
+echo "Installing Playwright dependencies..."
+playwright install chromium --with-deps || echo "Playwright install skipped"
 
+echo "Launching backend..."
+python backend.py
